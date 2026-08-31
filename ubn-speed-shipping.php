@@ -4,12 +4,30 @@
  * Plugin Name: UBN Speed Shipping
  * Plugin URI: https://soyoo.re
  * Description: Custom plugin to Integrate UBN shipping with Conforama.
- * Version: 1.2
+ * Version: 1.3
  * Author: soyoo.re
  * License: GPL2
  */
 
 if (!defined('ABSPATH')) exit;
+
+/*--------------------------------------------------------------
+# AUTOMATIC PLUGIN UPDATE CHECKER (GITHUB)
+--------------------------------------------------------------*/
+$ubn_puc_file = plugin_dir_path(__FILE__) . 'plugin-update-checker/plugin-update-checker.php';
+if (file_exists($ubn_puc_file)) {
+	require_once $ubn_puc_file;
+
+	$ubnUpdateChecker = \YahnisElsts\PluginUpdateChecker\v5\PucFactory::buildUpdateChecker(
+		'https://github.com/SOYOO974/woo-ubn-speed/',
+		__FILE__,
+		'ubn-speed-shipping'
+	);
+
+	// Set the branch that contains stable releases
+	$ubnUpdateChecker->setBranch('main');
+	$ubnUpdateChecker->getVcsApi()->enableReleaseAssets();
+}
 
 /*--------------------------------------------------------------
 # GET ACTIVE API CONFIG
