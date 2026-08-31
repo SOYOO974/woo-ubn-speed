@@ -4,7 +4,7 @@
  * Plugin Name: UBN Speed Shipping
  * Plugin URI: https://soyoo.re
  * Description: Custom plugin to Integrate UBN shipping with Conforama.
- * Version: 1.3
+ * Version: 1.4
  * Author: soyoo.re
  * License: GPL2
  */
@@ -1139,51 +1139,46 @@ function ubn_get_store_shipper_data($store_id = '') {
 function ubn_normalize_reunion_city($postcode, $city = '') {
 
 $map = [
-
-	'97439' => 'Sainte-Rose',
-	'97437' => 'Saint-Anne',
-	'97431' => 'La Plaine-des-Palmistes',
-	'97470' => 'Saint-Benoît',
 	'97412' => 'Bras-Panon',
-	'97433' => 'Salazie',
-	'97440' => 'Saint-André',
-	'97441' => 'Sainte-Suzanne',
-	'97438' => 'Sainte-Marie',
-	'97490' => 'Sainte-Clotilde',
-	'97400' => 'Saint-Denis',
-	'97417' => 'La Montagne',
-	'97419' => 'La Possession',
-	'97420' => 'Le Port',
-	'97460' => 'Saint-Paul',
-	'97435' => 'Saint Gilles Les Hauts',
-	'97422' => 'La Saline',
-	'97434' => 'La Saline Les Bains',
-	'97436' => 'Saint-Leu',
-	'97425' => 'Les Avirons',
-	'97427' => 'Etang-Salé',
-	'97450' => 'Saint-Louis',
-	'97414' => 'Entre-Deux',
-	'97430' => 'Le Tampon',
-	'97432' => 'Ravine des Cabris',
-	'97410' => 'Saint-Pierre',
-	'97429' => 'Petite-Île',
-	'97480' => 'Saint-Joseph',
-	'97442' => 'Saint-Philippe',
-	
-	// --- Taken from arranged data supplied by Julien
-	'97411' => 'Bois Nèfles Saint Paul',
-	'97423' => 'Guillaume',
-	'97426' => 'Les Trois-Bassins',
 	'97416' => 'Chaloupe Saint Leu',
+	'97423' => 'Guillaume',
+	'97417' => 'La Montagne',
+	'97431' => 'La Plaine-des-Palmistes',
+	'97411' => 'Bois Nefles Saint Paul',
+	'97419' => 'La Possession',
+	'97422' => 'La Saline',
+	'97420' => 'Le Port',
+	'97430' => 'Le Tampon',
+	'97414' => 'Entre-Deux',
+	'97425' => 'Les Avirons',
+	'97426' => 'Les Trois-Bassins',
+	'97427' => 'Etang-Sale',
+	'97429' => 'Petite-Ile',
 	'97424' => 'Piton Saint Leu',
-	'97421' => 'La Rivière Saint Louis',
 	'97418' => 'La Plaines des Cafres',
-
-	// --- Taken from the raw data supplied from email with attachement.
+	'97432' => 'Ravine des Cabris',
+	'97421' => 'La Riviere Saint Louis',
+	'97440' => 'Saint-Andre',
+	'97470' => 'Saint-Benoit',
+	'97400' => 'Saint-Denis',
+	'97480' => 'Saint-Joseph',
+	'97436' => 'Saint-Leu',
+	'97450' => 'Saint-Louis',
+	'97460' => 'Saint-Paul',
+	'97442' => 'Saint-Philippe',
+	'97410' => 'Saint-Pierre',
 	'97405' => 'Saint-Denis',
+	'97434' => 'Saint Gilles Les Bains',
+	'97435' => 'Saint Gilles Les Hauts',
 	'97457' => 'Saint-Pierre',
+	'97490' => 'Sainte-Clotilde',
+	'97438' => 'Sainte-Marie',
+	'97439' => 'Sainte-Rose',
+	'97441' => 'Sainte-Suzanne',
 	'97456' => 'Saint-Pierre',
+	'97433' => 'Salazie',
 	'97448' => 'Saint-Pierre',
+	'97437' => 'Saint-Anne',
 	'97491' => 'Sainte-Clotilde',
 ];
 
