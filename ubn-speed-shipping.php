@@ -4,7 +4,7 @@
  * Plugin Name: UBN Speed Shipping
  * Plugin URI: https://soyoo.re
  * Description: Custom plugin to Integrate UBN shipping with Conforama.
- * Version: 1.4
+ * Version: 1.4.1
  * Author: soyoo.re
  * License: GPL2
  */
@@ -1136,7 +1136,7 @@ function ubn_get_store_shipper_data($store_id = '') {
 # NORMALIZE REUNION CITY FOR UBN
 
 --------------------------------------------------------------*/
-function ubn_normalize_reunion_city($postcode, $city = '') {
+function ubn_normalize_reunion_city($postcode, $city = '', $address = '') {
 
 $map = [
 	'97412' => 'Bras-Panon',
@@ -1183,6 +1183,17 @@ $map = [
 ];
 
 $postcode = trim((string) $postcode);
+
+// Cas spécifique du code postal 97434 : deux villes distinctes dans l'API UBN Speed
+// 1) "La Saline Les Bains" (si 'saline' ou 'trou d'eau' figure dans la ville ou l'adresse)
+// 2) "Saint Gilles Les Bains" (par défaut pour 97434)
+if ($postcode === '97434') {
+	$context = (string) $city . ' ' . (string) $address;
+	if (stripos($context, 'saline') !== false || stripos($context, 'trou d\'eau') !== false || stripos($context, 'trou deau') !== false) {
+		return 'La Saline Les Bains';
+	}
+	return 'Saint Gilles Les Bains';
+}
 
 // Exact postcode match
 if (isset($map[$postcode])) {
@@ -1381,7 +1392,10 @@ function ubn_build_shipment_payload($order) {
 					?: $order->get_billing_postcode(),
 
 				$order->get_shipping_city()
-					?: $order->get_billing_city()
+					?: $order->get_billing_city(),
+
+				( $order->get_shipping_address_1() ?: $order->get_billing_address_1() ) . ' ' .
+				( $order->get_shipping_address_2() ?: $order->get_billing_address_2() )
 			),
 
 		'wpcargo_receiver_addressp' =>
