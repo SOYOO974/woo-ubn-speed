@@ -76,38 +76,31 @@ function ubn_get_api_config() {
 	}
 
 	return [
-
 		'api_base' =>
-			get_option(
-				'ubn_prod_api_base',
-				''
-			),
+			(defined('UBN_API_BASE') && !empty(UBN_API_BASE))
+				? UBN_API_BASE
+				: get_option('ubn_prod_api_base', ''),
 
 		'api_key' =>
-			get_option(
-				'ubn_prod_api_key',
-				''
-			),
+			(defined('UBN_API_KEY') && !empty(UBN_API_KEY))
+				? UBN_API_KEY
+				: get_option('ubn_prod_api_key', ''),
 
 		'hmac_secret' =>
-			get_option(
-				'ubn_prod_hmac_secret',
-				''
-			),
+			(defined('UBN_HMAC_SECRET') && !empty(UBN_HMAC_SECRET))
+				? UBN_HMAC_SECRET
+				: get_option('ubn_prod_hmac_secret', ''),
 
 		'partner_id' =>
-			get_option(
-				'ubn_prod_partner_id',
-				''
-			),
+			(defined('UBN_PARTNER_ID') && !empty(UBN_PARTNER_ID))
+				? UBN_PARTNER_ID
+				: get_option('ubn_prod_partner_id', ''),
 
 		'source_site' =>
-			get_option(
-				'ubn_prod_source_site',
-				''
-			),
+			(defined('UBN_SOURCE_SITE') && !empty(UBN_SOURCE_SITE))
+				? UBN_SOURCE_SITE
+				: get_option('ubn_prod_source_site', ''),
 	];
-
 }
 
 /*--------------------------------------------------------------
@@ -958,7 +951,7 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 	);
 	
 	
-	// Save shipment meta
+	// Save shipment meta (both legacy post meta and HPOS order object meta)
 	update_post_meta($order_id, '_ubn_shipment_created', 'yes');
 
 	update_post_meta(
@@ -996,6 +989,18 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 		'_ubn_shipment_response',
 		$data
 	);
+
+	// HPOS compatibility: explicitly update WC_Order meta and persist
+	if ($order && is_a($order, 'WC_Order')) {
+		$order->update_meta_data('_ubn_shipment_created', 'yes');
+		$order->update_meta_data('_ubn_tracking_number', sanitize_text_field($data['tracking_number'] ?? ''));
+		$order->update_meta_data('_ubn_shipment_id', sanitize_text_field($data['shipment_id'] ?? ''));
+		$order->update_meta_data('_ubn_wallet_debit', sanitize_text_field($data['wallet_debit'] ?? ''));
+		$order->update_meta_data('_ubn_wallet_ref', sanitize_text_field($data['wallet_ref'] ?? ''));
+		$order->update_meta_data('_ubn_pdf_url', esc_url_raw($data['pdf_url'] ?? ''));
+		$order->update_meta_data('_ubn_shipment_response', $data);
+		$order->save();
+	}
 	
 	ubn_send_preparation_email(
 		$order,
