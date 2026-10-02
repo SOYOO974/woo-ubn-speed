@@ -4,7 +4,7 @@
  * Plugin Name: UBN Speed Shipping
  * Plugin URI: https://soyoo.re
  * Description: Custom plugin to Integrate UBN shipping with Conforama.
- * Version: 1.4.1
+ * Version: 1.4.2
  * Author: soyoo.re
  * License: GPL2
  */
@@ -771,29 +771,38 @@ function ubn_create_shipment($order_id) {
 			'Order not found'
 		);
 
-		return;
+		return [
+			'success' => false,
+			'message' => 'Commande introuvable #' . $order_id,
+		];
 	}
 
 	// Verify shipping method
 	if (!ubn_is_ubn_order($order)) {
-		return;
+		return [
+			'success' => false,
+			'message' => 'Cette commande n\'utilise pas un mode de livraison UBN Speed.',
+		];
 	}
 
 	// Prevent duplicate shipment
-if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
+	if (get_post_meta($order_id, '_ubn_shipment_created', true) === 'yes' || ($order && $order->get_meta('_ubn_shipment_created') === 'yes')) {
 
-	ubn_add_log(
-		'debug',
-		'',
-		'',
-		'',
-		'',
-		$order_id,
-		'Shipment already exists'
-	);
+		ubn_add_log(
+			'debug',
+			'',
+			'',
+			'',
+			'',
+			$order_id,
+			'Shipment already exists'
+		);
 
-	return;
-}
+		return [
+			'success' => false,
+			'message' => 'Une expédition a déjà été créée pour cette commande.',
+		];
+	}
 
 
 	$payload = ubn_build_shipment_payload($order);
@@ -820,7 +829,10 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 			]
 		);
 
-		return;
+		return [
+			'success' => false,
+			'message' => 'Impossible de préparer les données de colis pour l\'API UBN (payload vide).',
+		];
 	}
 
 	$endpoint =
@@ -887,7 +899,10 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 			]
 		);
 		
-		return;
+		return [
+			'success' => false,
+			'message' => 'Erreur de connexion UBN : ' . $response->get_error_message(),
+		];
 	}
 	
 
@@ -905,15 +920,22 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 		empty($data['success'])
 	) {
 
+		$error_json = wp_json_encode([
+			'status_code' => $status_code,
+			'response'    => $data,
+			'raw'         => $response_body,
+		], JSON_PRETTY_PRINT);
+
 		update_post_meta(
 			$order_id,
 			'_ubn_shipment_error',
-			wp_json_encode([
-				'status_code' => $status_code,
-				'response'    => $data,
-				'raw'         => $response_body,
-			], JSON_PRETTY_PRINT)
+			$error_json
 		);
+
+		if ($order && is_a($order, 'WC_Order')) {
+			$order->update_meta_data('_ubn_shipment_error', $error_json);
+			$order->save();
+		}
 
 		ubn_add_log(
 			'shipment_error',
@@ -939,10 +961,25 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 			]
 		);
 
-		return;
+		$err_msg = $data['message'] ?? ($data['error'] ?? 'Code HTTP ' . $status_code);
+		if (!empty($data['data']['message'])) {
+			$err_msg = $data['data']['message'];
+		} elseif (!empty($data['data']['expected_postcode'])) {
+			$err_msg .= ' (Code postal attendu : ' . $data['data']['expected_postcode'] . ')';
+		}
+
+		return [
+			'success'     => false,
+			'message'     => $err_msg,
+			'status_code' => $status_code,
+			'data'        => $data,
+		];
 	}
 	
 	delete_post_meta($order_id, '_ubn_shipment_error');
+	if ($order && is_a($order, 'WC_Order')) {
+		$order->delete_meta_data('_ubn_shipment_error');
+	}
 
 	update_post_meta(
 		$order_id,
@@ -1017,6 +1054,13 @@ if (get_post_meta($order_id, '_ubn_shipment_created', true)) {
 		$order_id,
 		'Shipment created successfully'
 	);
+
+	return [
+		'success'         => true,
+		'tracking_number' => $data['tracking_number'] ?? '',
+		'shipment_id'     => $data['shipment_id'] ?? '',
+		'data'            => $data,
+	];
 }
 /*--------------------------------------------------------------
 
@@ -2899,16 +2943,19 @@ function ubn_remove_shipping_from_all_zones() {
 // Add custom order action
 add_filter(
 	'woocommerce_order_actions',
-	'ubn_add_create_shipment_order_action'
+	'ubn_add_create_shipment_order_action',
+	10,
+	2
 );
 
-function ubn_add_create_shipment_order_action($actions) {
+function ubn_add_create_shipment_order_action($actions, $order = null) {
 
 	global $theorder;
+	$order = $order ?: $theorder;
 
 	if (
-		!$theorder ||
-		!ubn_is_ubn_order($theorder)
+		!$order ||
+		!ubn_is_ubn_order($order)
 	) {
 		return $actions;
 	}
@@ -3162,20 +3209,72 @@ function ubn_show_shipment_debug_admin($order) {
 	// ERROR
 	if ($error) {
 
+		$retry_url = wp_nonce_url(
+			admin_url('admin.php?ubn_action=retry_shipment&order_id=' . $order_id),
+			'ubn_retry_shipment_' . $order_id
+		);
+
+		$clear_url = wp_nonce_url(
+			admin_url('admin.php?ubn_action=clear_error&order_id=' . $order_id),
+			'ubn_clear_error_' . $order_id
+		);
+
 		echo '
 		<div style="
 			background:#fff5f5;
 			border:1px solid #dc3232;
 			padding:15px;
+			border-radius:6px;
+			margin-bottom:15px;
 		">
-			<strong style="color:#dc3232;">
-				Shipment API Error
+			<strong style="color:#dc3232; font-size:14px;">
+				⚠️ Erreur API Expédition UBN Speed
 			</strong>
 
 			<pre style="
 				margin-top:10px;
 				white-space:pre-wrap;
+				background:#fff;
+				padding:10px;
+				border:1px solid #fed7d7;
+				border-radius:4px;
+				font-size:12px;
 			">' . esc_html($error) . '</pre>
+
+			<div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
+				<a
+					href="' . esc_url($retry_url) . '"
+					class="button button-primary"
+					onclick="return confirm(\'Relancer la création de l\\\'expédition UBN Speed avec les données actuelles de la commande ?\');"
+				>
+					🚀 Réessayer l\'expédition UBN maintenant
+				</a>
+				<a
+					href="' . esc_url($clear_url) . '"
+					class="button button-secondary"
+					onclick="return confirm(\'Effacer cet historique d\\\'erreur ?\');"
+				>
+					🗑️ Effacer cette erreur
+				</a>
+			</div>
+		</div>';
+	} elseif (!$success && ubn_is_ubn_order($order)) {
+
+		$create_url = wp_nonce_url(
+			admin_url('admin.php?ubn_action=retry_shipment&order_id=' . $order_id),
+			'ubn_retry_shipment_' . $order_id
+		);
+
+		echo '
+		<div style="margin-bottom:15px; padding:12px 15px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px;">
+			<p style="margin:0 0 10px 0; font-size:13px; color:#334155;"><strong>UBN Speed :</strong> Aucune expédition n\'a encore été créée pour cette commande.</p>
+			<a
+				href="' . esc_url($create_url) . '"
+				class="button button-primary"
+				onclick="return confirm(\'Créer l\\\'expédition UBN Speed pour cette commande ?\');"
+			>
+				🚀 Créer l\'expédition UBN
+			</a>
 		</div>';
 	}
 
@@ -3261,6 +3360,117 @@ function ubn_show_shipment_debug_admin($order) {
 	<?php
 	endif;
 }
+
+/*--------------------------------------------------------------
+# HANDLE MANUAL SHIPMENT ACTIONS (ORDER EDIT SCREEN)
+--------------------------------------------------------------*/
+add_action('admin_init', 'ubn_handle_order_edit_page_actions');
+function ubn_handle_order_edit_page_actions() {
+	if (!is_admin() || !current_user_can('manage_woocommerce')) {
+		return;
+	}
+
+	if (isset($_GET['ubn_action']) && isset($_GET['order_id'])) {
+		$order_id = absint($_GET['order_id']);
+		$action   = sanitize_key($_GET['ubn_action']);
+
+		if ($action === 'retry_shipment') {
+			check_admin_referer('ubn_retry_shipment_' . $order_id);
+			$res = ubn_create_shipment($order_id);
+
+			$redirect_url = wp_get_referer() ?: admin_url('post.php?post=' . $order_id . '&action=edit');
+			$redirect_url = remove_query_arg(['ubn_notice', 'ubn_order', 'ubn_tracking', 'ubn_msg', 'ubn_action'], $redirect_url);
+
+			if (!empty($res['success'])) {
+				$redirect_url = add_query_arg([
+					'ubn_notice'   => 'success',
+					'ubn_order'    => $order_id,
+					'ubn_tracking' => rawurlencode($res['tracking_number'] ?? ''),
+				], $redirect_url);
+			} else {
+				$redirect_url = add_query_arg([
+					'ubn_notice' => 'error',
+					'ubn_order'  => $order_id,
+					'ubn_msg'    => rawurlencode($res['message'] ?? 'Erreur lors de la création de l\'expédition'),
+				], $redirect_url);
+			}
+
+			wp_safe_redirect($redirect_url);
+			exit;
+		}
+
+		if ($action === 'clear_error') {
+			check_admin_referer('ubn_clear_error_' . $order_id);
+			delete_post_meta($order_id, '_ubn_shipment_error');
+			$order = wc_get_order($order_id);
+			if ($order && is_a($order, 'WC_Order')) {
+				$order->delete_meta_data('_ubn_shipment_error');
+				$order->save();
+			}
+
+			$redirect_url = wp_get_referer() ?: admin_url('post.php?post=' . $order_id . '&action=edit');
+			$redirect_url = remove_query_arg(['ubn_notice', 'ubn_order', 'ubn_tracking', 'ubn_msg', 'ubn_action'], $redirect_url);
+			$redirect_url = add_query_arg([
+				'ubn_notice' => 'cleared',
+				'ubn_order'  => $order_id,
+			], $redirect_url);
+
+			wp_safe_redirect($redirect_url);
+			exit;
+		}
+	}
+}
+
+/*--------------------------------------------------------------
+# RESET ERROR WHEN ORDER IS EDITED IN WOOCOMMERCE
+--------------------------------------------------------------*/
+add_action('woocommerce_update_order', 'ubn_reset_error_on_order_update', 20, 2);
+function ubn_reset_error_on_order_update($order_id, $order = null) {
+	if (!$order_id) {
+		return;
+	}
+	if (!$order || !is_a($order, 'WC_Order')) {
+		$order = wc_get_order($order_id);
+	}
+	if (!$order) {
+		return;
+	}
+
+	// If the order has an existing shipment error and shipment is not created yet,
+	// clear the error so obsolete error messages do not persist after address correction.
+	$created = $order->get_meta('_ubn_shipment_created');
+	if ($created !== 'yes' && get_post_meta($order_id, '_ubn_shipment_created', true) !== 'yes') {
+		if ($order->get_meta('_ubn_shipment_error') || get_post_meta($order_id, '_ubn_shipment_error', true)) {
+			$order->delete_meta_data('_ubn_shipment_error');
+			delete_post_meta($order_id, '_ubn_shipment_error');
+			$order->save();
+		}
+	}
+}
+
+/*--------------------------------------------------------------
+# ADMIN NOTICES FOR UBN ACTIONS
+--------------------------------------------------------------*/
+add_action('admin_notices', 'ubn_display_admin_notices');
+function ubn_display_admin_notices() {
+	if (!isset($_GET['ubn_notice'])) {
+		return;
+	}
+
+	$notice_type = sanitize_key($_GET['ubn_notice']);
+	$order_id    = isset($_GET['ubn_order']) ? absint($_GET['ubn_order']) : 0;
+	$tracking    = isset($_GET['ubn_tracking']) ? sanitize_text_field(rawurldecode($_GET['ubn_tracking'])) : '';
+	$msg         = isset($_GET['ubn_msg']) ? sanitize_text_field(rawurldecode($_GET['ubn_msg'])) : '';
+
+	if ($notice_type === 'success') {
+		echo '<div class="notice notice-success is-dismissible" style="border-left-color:#46b450;"><p><strong>✓ UBN Speed :</strong> Expédition créée avec succès pour la commande <strong>#' . esc_html($order_id) . '</strong>' . ($tracking ? ' (N° de suivi : <strong>' . esc_html($tracking) . '</strong>)' : '') . '.</p></div>';
+	} elseif ($notice_type === 'error') {
+		echo '<div class="notice notice-error is-dismissible" style="border-left-color:#dc3232;"><p><strong>✕ UBN Speed :</strong> Échec de l\'expédition pour la commande <strong>#' . esc_html($order_id) . '</strong> : ' . esc_html($msg) . '</p></div>';
+	} elseif ($notice_type === 'cleared') {
+		echo '<div class="notice notice-info is-dismissible"><p><strong>ℹ UBN Speed :</strong> L\'historique d\'erreur de la commande <strong>#' . esc_html($order_id) . '</strong> a été effacé. Vous pouvez relancer la création de l\'expédition.</p></div>';
+	}
+}
+
 /*--------------------------------------------------------------
 # UBN ORDERS PAGE
 --------------------------------------------------------------*/
@@ -3612,17 +3822,27 @@ function ubn_handle_orders_page_shipment_creation() {
 		'Shipment manually created from Orders page'
 	);
 
-    ubn_create_shipment($order_id);
-	
-	
+	$res = ubn_create_shipment($order_id);
 
-    wp_safe_redirect(
-        admin_url(
-            'admin.php?page=ubn-ss&tab=orders&shipment_created=' . $order_id
-        )
-    );
+	$redirect_url = admin_url('admin.php?page=ubn-ss&tab=orders');
+	if (!empty($res['success'])) {
+		$redirect_url = add_query_arg([
+			'shipment_created' => $order_id,
+			'ubn_notice'       => 'success',
+			'ubn_order'        => $order_id,
+			'ubn_tracking'     => rawurlencode($res['tracking_number'] ?? ''),
+		], $redirect_url);
+	} else {
+		$redirect_url = add_query_arg([
+			'ubn_notice' => 'error',
+			'ubn_order'  => $order_id,
+			'ubn_msg'    => rawurlencode($res['message'] ?? 'Erreur lors de la création de l\'expédition'),
+		], $redirect_url);
+	}
 
-    exit;
+	wp_safe_redirect($redirect_url);
+
+	exit;
 }
 
 /*--------------------------------------------------------------
