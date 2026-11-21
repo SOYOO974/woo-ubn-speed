@@ -234,7 +234,9 @@ function ubn_execute_daily_report() {
     if ($mode === 'single') {
         $single_orders = [];
         foreach ($orders as $order) {
-            $shipment_created = get_post_meta($order->get_id(), '_ubn_shipment_created', true);
+            $shipment_created = function_exists('ubn_get_order_meta_val')
+                ? ubn_get_order_meta_val($order, '_ubn_shipment_created')
+                : get_post_meta($order->get_id(), '_ubn_shipment_created', true);
             if ($shipment_created !== 'yes') {
                 continue;
             }
@@ -243,12 +245,14 @@ function ubn_execute_daily_report() {
         $brand_name = get_option('ubn_ss_brand_name', get_bloginfo('name'));
         ubn_process_store_report('single', $brand_name, $single_orders, $date_phrase);
     } else {
-        // 3. Separate by store & filter legacy meta
+        // 3. Separate by store & filter legacy/HPOS meta
         $nord_orders = [];
         $sud_orders = [];
 
         foreach ($orders as $order) {
-            $shipment_created = get_post_meta($order->get_id(), '_ubn_shipment_created', true);
+            $shipment_created = function_exists('ubn_get_order_meta_val')
+                ? ubn_get_order_meta_val($order, '_ubn_shipment_created')
+                : get_post_meta($order->get_id(), '_ubn_shipment_created', true);
             if ($shipment_created !== 'yes') {
                 continue;
             }
@@ -330,8 +334,12 @@ function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase)
             }
             
             $print_note_url = home_url('/?ubn_print_note=' . $order_id . '&token=' . ubn_generate_print_token($order_id));
-            $tracking_number = get_post_meta($order_id, '_ubn_tracking_number', true);
-            $shipment_id = get_post_meta($order_id, '_ubn_shipment_id', true);
+            $tracking_number = function_exists('ubn_get_order_meta_val')
+                ? ubn_get_order_meta_val($order, '_ubn_tracking_number')
+                : get_post_meta($order_id, '_ubn_tracking_number', true);
+            $shipment_id = function_exists('ubn_get_order_meta_val')
+                ? ubn_get_order_meta_val($order, '_ubn_shipment_id')
+                : get_post_meta($order_id, '_ubn_shipment_id', true);
             
             $orders_html .= '
             <div style="border: 2px solid #e5e5e5; border-radius: 8px; margin-bottom: 20px; background: #ffffff;">

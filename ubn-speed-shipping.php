@@ -4,12 +4,40 @@
  * Plugin Name: UBN Speed Shipping
  * Plugin URI: https://soyoo.re
  * Description: Custom plugin to Integrate UBN shipping with Conforama.
- * Version: 1.4.3
+ * Version: 1.4.4
  * Author: soyoo.re
  * License: GPL2
  */
 
 if (!defined('ABSPATH')) exit;
+
+if (!defined('UBN_SS_VERSION')) {
+	define('UBN_SS_VERSION', '1.4.4');
+}
+if (!defined('UBN_ASYNC_SHIPMENT_HOOK')) {
+	define('UBN_ASYNC_SHIPMENT_HOOK', 'ubn_process_shipment_async');
+}
+if (!defined('UBN_ASYNC_SHIPMENT_GROUP')) {
+	define('UBN_ASYNC_SHIPMENT_GROUP', 'ubn-speed-shipping');
+}
+if (!defined('UBN_MAX_SHIPMENT_ATTEMPTS')) {
+	define('UBN_MAX_SHIPMENT_ATTEMPTS', 4);
+}
+
+// Declare WooCommerce HPOS (custom_order_tables) compatibility
+add_action('before_woocommerce_init', function () {
+	if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+		\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+	}
+});
+
+// Add quick "Settings" link in wp-admin/plugins.php
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), function ($links) {
+	$settings_url  = admin_url('options-general.php?page=ubn-ss');
+	$settings_link = '<a href="' . esc_url($settings_url) . '" style="font-weight:600;">Settings</a>';
+	array_unshift($links, $settings_link);
+	return $links;
+});
 
 /*--------------------------------------------------------------
 # AUTOMATIC PLUGIN UPDATE CHECKER (GITHUB)
@@ -183,30 +211,253 @@ function ubn_add_log($type, $endpoint = '', $request_data = '', $response_data =
 
 
 /*--------------------------------------------------------------
-# CREATE SHIPMENT WHEN ORDER GOES PROCESSING
+# HPOS + LEGACY ORDER META HELPERS & ASYNC RETRY ENGINE
 --------------------------------------------------------------*/
-add_action('woocommerce_order_status_changed','ubn_create_processing_shipment',20,4);
+function ubn_get_order_meta_val($order_or_id, $key) {
+	$order    = is_a($order_or_id, 'WC_Order') ? $order_or_id : wc_get_order($order_or_id);
+	$order_id = $order ? $order->get_id() : (int) $order_or_id;
 
-function ubn_create_processing_shipment($order_id, $old_status, $new_status, $order) {
+	if ($order) {
+		$val = $order->get_meta($key, true);
+		if ($val !== '' && $val !== null && $val !== []) {
+			return $val;
+		}
+	}
+
+	return $order_id ? get_post_meta($order_id, $key, true) : '';
+}
+
+function ubn_save_order_safely($order) {
+	if (!$order || !is_a($order, 'WC_Order')) {
+		return;
+	}
+	$prev = !empty($GLOBALS['ubn_internal_order_save']);
+	$GLOBALS['ubn_internal_order_save'] = true;
+	try {
+		$order->save();
+	} finally {
+		$GLOBALS['ubn_internal_order_save'] = $prev;
+	}
+}
+
+function ubn_get_order_edit_link($order_or_id) {
+	$order = is_a($order_or_id, 'WC_Order') ? $order_or_id : wc_get_order($order_or_id);
+	if ($order && method_exists($order, 'get_edit_order_url')) {
+		$url = $order->get_edit_order_url();
+		if (!empty($url)) {
+			return $url;
+		}
+	}
+	$order_id = $order ? $order->get_id() : (int) $order_or_id;
+	return admin_url('post.php?post=' . $order_id . '&action=edit');
+}
+
+/**
+ * Delay in seconds after each failed attempt:
+ * - Attempt 1 fails -> Retry #2 in 5 minutes (300s)
+ * - Attempt 2 fails -> Retry #3 in 30 minutes (1800s)
+ * - Attempt 3 fails -> Retry #4 in 2 hours (7200s)
+ * - Attempt 4 fails -> Exhausted (final failure email sent)
+ */
+function ubn_get_retry_delays() {
+	return [
+		1 => 300,
+		2 => 1800,
+		3 => 7200,
+	];
+}
+
+/**
+ * Determine whether an API failure is transient (network / timeout / 5xx / upstream receiver outage)
+ * vs permanent (4xx validation, postcode, wallet balance, auth).
+ */
+function ubn_is_retryable_shipment_failure($is_wp_error, $status_code = 0, $decoded_response = null, $raw_response = '') {
+	if ($is_wp_error) {
+		return true;
+	}
+
+	$code = (int) $status_code;
+	if ($code === 0 || $code >= 500 || in_array($code, [408, 425, 429], true)) {
+		return true;
+	}
+
+	$api_err_code = is_array($decoded_response) ? (string) ($decoded_response['code'] ?? '') : '';
+	if (in_array($api_err_code, ['receiver_error', 'http_request_failed', 'connect_error', 'timeout'], true)) {
+		return true;
+	}
+
+	$haystack = strtolower((string) $raw_response . ' ' . wp_json_encode($decoded_response));
+	if (preg_match('/curl error|failed to connect|couldn\'t connect|timed out|operation timed out|connection reset|connection refused|bad gateway|service unavailable|gateway time-out/', $haystack)) {
+		return true;
+	}
+
+	return false;
+}
+
+function ubn_clear_scheduled_shipment_retries($order_id) {
+	$order_id = (int) $order_id;
+	if (!$order_id) {
+		return;
+	}
+
+	for ($a = 1; $a <= UBN_MAX_SHIPMENT_ATTEMPTS + 1; $a++) {
+		$args = ['order_id' => $order_id, 'attempt' => $a];
+		if (function_exists('as_unschedule_all_actions')) {
+			as_unschedule_all_actions(UBN_ASYNC_SHIPMENT_HOOK, $args, UBN_ASYNC_SHIPMENT_GROUP);
+		}
+		wp_clear_scheduled_hook(UBN_ASYNC_SHIPMENT_HOOK, [$order_id, $a]);
+		wp_clear_scheduled_hook(UBN_ASYNC_SHIPMENT_HOOK, [$args]);
+	}
+}
+
+function ubn_has_pending_shipment_retry($order_id) {
+	$order_id = (int) $order_id;
+	if (!$order_id) {
+		return false;
+	}
+
+	for ($a = 1; $a <= UBN_MAX_SHIPMENT_ATTEMPTS; $a++) {
+		$args = ['order_id' => $order_id, 'attempt' => $a];
+		if (function_exists('as_has_scheduled_action') && as_has_scheduled_action(UBN_ASYNC_SHIPMENT_HOOK, $args, UBN_ASYNC_SHIPMENT_GROUP)) {
+			return true;
+		}
+		if (wp_next_scheduled(UBN_ASYNC_SHIPMENT_HOOK, [$order_id, $a])) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+function ubn_schedule_shipment_attempt($order_id, $attempt = 1, $delay_seconds = 0) {
+	$order_id      = (int) $order_id;
+	$attempt       = max(1, (int) $attempt);
+	$delay_seconds = max(0, (int) $delay_seconds);
+	$args          = ['order_id' => $order_id, 'attempt' => $attempt];
+	$run_at        = time() + $delay_seconds;
+
+	if ($delay_seconds <= 0) {
+		if (function_exists('as_enqueue_async_action')) {
+			if (!function_exists('as_has_scheduled_action') || !as_has_scheduled_action(UBN_ASYNC_SHIPMENT_HOOK, $args, UBN_ASYNC_SHIPMENT_GROUP)) {
+				as_enqueue_async_action(UBN_ASYNC_SHIPMENT_HOOK, $args, UBN_ASYNC_SHIPMENT_GROUP, true);
+			}
+		} else {
+			$run_at = time() + 5;
+			if (!wp_next_scheduled(UBN_ASYNC_SHIPMENT_HOOK, [$order_id, $attempt])) {
+				wp_schedule_single_event($run_at, UBN_ASYNC_SHIPMENT_HOOK, [$order_id, $attempt]);
+			}
+		}
+	} else {
+		if (function_exists('as_schedule_single_action')) {
+			as_schedule_single_action($run_at, UBN_ASYNC_SHIPMENT_HOOK, $args, UBN_ASYNC_SHIPMENT_GROUP, true);
+		} else {
+			if (!wp_next_scheduled(UBN_ASYNC_SHIPMENT_HOOK, [$order_id, $attempt])) {
+				wp_schedule_single_event($run_at, UBN_ASYNC_SHIPMENT_HOOK, [$order_id, $attempt]);
+			}
+		}
+
+		update_post_meta($order_id, '_ubn_next_retry_at', (string) $run_at);
+		update_post_meta($order_id, '_ubn_next_retry_attempt', (string) $attempt);
+		delete_post_meta($order_id, '_ubn_retry_exhausted');
+
+		$order = wc_get_order($order_id);
+		if ($order) {
+			$order->update_meta_data('_ubn_next_retry_at', (string) $run_at);
+			$order->update_meta_data('_ubn_next_retry_attempt', (string) $attempt);
+			$order->delete_meta_data('_ubn_retry_exhausted');
+			ubn_save_order_safely($order);
+		}
+	}
+
+	return $run_at;
+}
+
+/*--------------------------------------------------------------
+# CREATE SHIPMENT WHEN ORDER GOES PROCESSING (ASYNC + AUTO-RETRY)
+--------------------------------------------------------------*/
+add_action('woocommerce_order_status_changed', 'ubn_create_processing_shipment', 20, 4);
+
+function ubn_create_processing_shipment($order_id, $old_status, $new_status, $order = null) {
+
+	if (!$order_id || $new_status !== 'processing') {
+		return;
+	}
+
+	$order = ($order && is_a($order, 'WC_Order')) ? $order : wc_get_order($order_id);
+
+	if (!$order || !ubn_is_ubn_order($order)) {
+		return;
+	}
+
+	if (ubn_get_order_meta_val($order, '_ubn_order') !== 'yes') {
+		update_post_meta($order_id, '_ubn_order', 'yes');
+		$order->update_meta_data('_ubn_order', 'yes');
+		ubn_save_order_safely($order);
+	}
+
+	if (ubn_get_order_meta_val($order, '_ubn_shipment_created') === 'yes') {
+		return;
+	}
+
+	if (ubn_has_pending_shipment_retry($order_id)) {
+		return;
+	}
+
+	ubn_schedule_shipment_attempt($order_id, 1, 0);
+}
+
+add_action(UBN_ASYNC_SHIPMENT_HOOK, 'ubn_handle_scheduled_shipment_attempt', 10, 2);
+
+function ubn_handle_scheduled_shipment_attempt($order_id, $attempt = 1) {
+	if (is_array($order_id)) {
+		$attempt  = (int) ($order_id['attempt'] ?? 1);
+		$order_id = (int) ($order_id['order_id'] ?? 0);
+	}
+
+	$order_id = (int) $order_id;
+	$attempt  = max(1, (int) $attempt);
 
 	if (!$order_id) {
 		return;
 	}
 
 	$order = wc_get_order($order_id);
-
 	if (!$order) {
 		return;
 	}
 
-	// Only when becoming processing
-	if ($new_status !== 'processing') {
+	if (ubn_get_order_meta_val($order, '_ubn_shipment_created') === 'yes') {
+		delete_post_meta($order_id, '_ubn_next_retry_at');
+		delete_post_meta($order_id, '_ubn_next_retry_attempt');
+		$order->delete_meta_data('_ubn_next_retry_at');
+		$order->delete_meta_data('_ubn_next_retry_attempt');
+		ubn_save_order_safely($order);
 		return;
 	}
-	
 
+	$status = $order->get_status();
+	if (in_array($status, ['cancelled', 'refunded', 'failed', 'trash'], true)) {
+		delete_post_meta($order_id, '_ubn_next_retry_at');
+		delete_post_meta($order_id, '_ubn_next_retry_attempt');
+		$order->delete_meta_data('_ubn_next_retry_at');
+		$order->delete_meta_data('_ubn_next_retry_attempt');
+		ubn_save_order_safely($order);
+		ubn_add_log(
+			'debug',
+			'',
+			'',
+			'',
+			'',
+			$order_id,
+			sprintf('Scheduled attempt #%d skipped because order status is %s', $attempt, $status)
+		);
+		return;
+	}
 
-	ubn_create_shipment($order_id);
+	ubn_create_shipment($order_id, [
+		'context' => 'scheduled',
+		'attempt' => $attempt,
+	]);
 }
 
 // Disable frontend execution if disabled from settings 
@@ -510,13 +761,7 @@ function ubn_send_preparation_email(
 
     $order_id = $order->get_id();
 
-    if (
-        get_post_meta(
-            $order_id,
-            '_ubn_preparation_email_sent',
-            true
-        )
-    ) {
+    if (ubn_get_order_meta_val($order, '_ubn_preparation_email_sent')) {
         return;
     }
 
@@ -572,24 +817,19 @@ function ubn_send_preparation_email(
     );
 
     if ($sent) {
+        $sent_at       = current_time('mysql');
+        $recipients_str = implode(', ', $emails);
 
-        update_post_meta(
-        $order_id,
-        '_ubn_preparation_email_sent',
-        current_time('mysql')
-		);
+        update_post_meta($order_id, '_ubn_preparation_email_sent', $sent_at);
+        update_post_meta($order_id, '_ubn_preparation_email_recipients', $recipients_str);
+        update_post_meta($order_id, '_ubn_preparation_email_subject', $subject);
 
-		update_post_meta(
-			$order_id,
-			'_ubn_preparation_email_recipients',
-			implode(', ', $emails)
-		);
-
-		update_post_meta(
-			$order_id,
-			'_ubn_preparation_email_subject',
-			$subject
-		);
+        if (is_a($order, 'WC_Order')) {
+            $order->update_meta_data('_ubn_preparation_email_sent', $sent_at);
+            $order->update_meta_data('_ubn_preparation_email_recipients', $recipients_str);
+            $order->update_meta_data('_ubn_preparation_email_subject', $subject);
+            ubn_save_order_safely($order);
+        }
 
         ubn_add_log(
             'email_success',
@@ -621,7 +861,9 @@ function ubn_send_preparation_email(
 function ubn_send_shipment_failure_email(
     $order_id,
     $payload,
-    $error_data
+    $error_data,
+    $attempt = 1,
+    $was_retryable = false
 ) {
 
     $raw_emails = get_option('ubn_ss_admin_error_emails', "saifwebservices@gmail.com, julien@soyoo.re");
@@ -630,14 +872,28 @@ function ubn_send_shipment_failure_email(
         $recipients = [get_option('admin_email')];
     }
 
+    $attempt = max(1, (int) $attempt);
+    $suffix  = ($attempt > 1) ? ' (After ' . $attempt . ' Attempts)' : '';
+
     $subject =
-        '[UBN] Shipment Creation Failed - Order #' . $order_id;
+        '[UBN] Shipment Creation Failed' . $suffix . ' - Order #' . $order_id;
 
     $message = '';
 
-    $message .= "A shipment creation attempt failed.\n\n";
+    if ($was_retryable && $attempt >= UBN_MAX_SHIPMENT_ATTEMPTS) {
+        $message .= sprintf(
+            "UBN Speed shipment creation failed permanently after %d automatic attempts (+5 min, +30 min, +2 h).\nManual intervention is required.\n\n",
+            $attempt
+        );
+    } elseif (!$was_retryable) {
+        $message .= "UBN Speed shipment creation failed with a non-retryable validation/API error (automatic retries skipped).\nManual intervention is required.\n\n";
+    } else {
+        $message .= "A shipment creation attempt failed.\n\n";
+    }
 
-    $message .= "Order ID: " . $order_id . "\n\n";
+    $message .= "Order ID: " . $order_id . "\n";
+    $message .= "Attempt: " . $attempt . " / " . UBN_MAX_SHIPMENT_ATTEMPTS . "\n";
+    $message .= "Admin Order URL: " . ubn_get_order_edit_link($order_id) . "\n\n";
 
     $message .= "Error Details:\n";
 
@@ -755,7 +1011,7 @@ function ubn_order_uses_shipping($order) {
 /*--------------------------------------------------------------
 # CREATE UBN SHIPMENT
 --------------------------------------------------------------*/
-function ubn_create_shipment($order_id) {
+function ubn_create_shipment($order_id, $options = []) {
 
 	$order = wc_get_order($order_id);
 
@@ -786,7 +1042,7 @@ function ubn_create_shipment($order_id) {
 	}
 
 	// Prevent duplicate shipment
-	if (get_post_meta($order_id, '_ubn_shipment_created', true) === 'yes' || ($order && $order->get_meta('_ubn_shipment_created') === 'yes')) {
+	if (ubn_get_order_meta_val($order, '_ubn_shipment_created') === 'yes') {
 
 		ubn_add_log(
 			'debug',
@@ -804,263 +1060,280 @@ function ubn_create_shipment($order_id) {
 		];
 	}
 
-
-	$payload = ubn_build_shipment_payload($order);
-	
-	$config = ubn_get_api_config();
-
-	if (empty($payload)) {
-
-		ubn_add_log(
-			'shipment_error',
-			'',
-			$payload,
-			'',
-			'',
-			$order_id,
-			'Failed to build shipment payload'
-		);
-		
-		ubn_send_shipment_failure_email(
-			$order_id,
-			[],
-			[
-				'error' => 'Failed to build shipment payload'
-			]
-		);
-
+	$lock_key = 'ubn_creating_shipment_lock_' . (int) $order_id;
+	if (get_transient($lock_key)) {
 		return [
 			'success' => false,
-			'message' => 'Impossible de préparer les données de colis pour l\'API UBN (payload vide).',
+			'message' => 'Une création d\'expédition UBN Speed est déjà en cours d\'exécution pour cette commande.',
 		];
 	}
+	set_transient($lock_key, time(), 60);
 
-	$endpoint =
-	trailingslashit(
-		$config['api_base']
-	) . 'shipments';
+	try {
+		$context      = is_array($options) && !empty($options['context']) ? (string) $options['context'] : 'manual';
+		$prev_attempt = (int) ubn_get_order_meta_val($order, '_ubn_shipment_attempts');
+		$attempt      = is_array($options) && !empty($options['attempt'])
+			? max(1, (int) $options['attempt'])
+			: max(1, $prev_attempt + 1);
 
-	$body_raw = wp_json_encode($payload);
+		$payload = ubn_build_shipment_payload($order);
+		$config  = ubn_get_api_config();
 
-	$timestamp = time();
+		$record_shipment_failure = function ($err_msg, $status_code_val, $error_payload_meta, $email_error_data, $is_retryable, $endpoint_val = '') use ($order, $order_id, $payload, $context, $attempt) {
+			$error_payload_meta['attempt']      = $attempt;
+			$error_payload_meta['max_attempts'] = UBN_MAX_SHIPMENT_ATTEMPTS;
+			$error_payload_meta['recorded_at']  = current_time('mysql');
 
-	$message = $timestamp . "." . $body_raw;
+			$error_json = wp_json_encode($error_payload_meta, JSON_PRETTY_PRINT);
 
-	$signature = hash_hmac(
-		"sha256",
-		$message,
-		$config['api_key']
-	);
+			update_post_meta($order_id, '_ubn_shipment_error', $error_json);
+			update_post_meta($order_id, '_ubn_shipment_attempts', (string) $attempt);
 
-	$response = wp_remote_post($endpoint, [
-
-		'headers' => [
-
-			'X-UBN-API-KEY' =>
-				$config['api_key'],
-
-			'X-UBN-Source-Site' =>
-				$config['source_site'],
-
-			'X-UBN-Partner' =>
-				$config['partner_id'],
-
-			'X-UBN-Customer' =>
-				$config['partner_id'],
-			'X-UBN-Timestamp'   => $timestamp,
-			'X-UBN-Sign'        => $signature,
-			'Content-Type'      => 'application/json'
-		],
-
-		'body' => $body_raw,
-
-		'timeout' => 30
-	]);
-
-	// WP Error
-	if (is_wp_error($response)) {
-
-		ubn_add_log(
-			'shipment_error',
-			$endpoint,
-			$payload,
-			$response->get_error_message(),
-			'wp_error',
-			$order_id,
-			'Shipment request failed'
-		);
-		
-		ubn_send_shipment_failure_email(
-			$order_id,
-			$payload,
-			[
-				'wp_error' =>
-					$response->get_error_message()
-			]
-		);
-		
-		return [
-			'success' => false,
-			'message' => 'Erreur de connexion UBN : ' . $response->get_error_message(),
-		];
-	}
-	
-
-	$status_code = wp_remote_retrieve_response_code($response);
-	
-	
-
-	$response_body = wp_remote_retrieve_body($response);
-
-	$data = json_decode($response_body, true);
-
-	// API failed
-	if (
-		$status_code >= 400 ||
-		empty($data['success'])
-	) {
-
-		$error_json = wp_json_encode([
-			'status_code' => $status_code,
-			'response'    => $data,
-			'raw'         => $response_body,
-		], JSON_PRETTY_PRINT);
-
-		update_post_meta(
-			$order_id,
-			'_ubn_shipment_error',
-			$error_json
-		);
-
-		if ($order && is_a($order, 'WC_Order')) {
 			$order->update_meta_data('_ubn_shipment_error', $error_json);
-			$order->save();
+			$order->update_meta_data('_ubn_shipment_attempts', (string) $attempt);
+
+			ubn_add_log(
+				'shipment_error',
+				$endpoint_val,
+				$payload,
+				$email_error_data,
+				(string) $status_code_val,
+				$order_id,
+				sprintf('Shipment API failed (Attempt #%d/%d - %s)', $attempt, UBN_MAX_SHIPMENT_ATTEMPTS, $context)
+			);
+
+			if ($context === 'scheduled') {
+				$retry_delays = ubn_get_retry_delays();
+
+				if ($is_retryable && isset($retry_delays[$attempt])) {
+					$delay        = (int) $retry_delays[$attempt];
+					$next_attempt = $attempt + 1;
+					$next_run_ts  = ubn_schedule_shipment_attempt($order_id, $next_attempt, $delay);
+					$delay_label  = ($delay >= 3600) ? round($delay / 3600) . ' h' : round($delay / 60) . ' min';
+					$next_time    = wp_date('H:i', $next_run_ts);
+
+					$order->add_order_note(
+						sprintf(
+							'UBN Speed : échec temporaire lors de la tentative #%d/%d (%s). Nouvelle tentative automatique #%d programmée dans %s (vers %s).',
+							$attempt,
+							UBN_MAX_SHIPMENT_ATTEMPTS,
+							$err_msg,
+							$next_attempt,
+							$delay_label,
+							$next_time
+						),
+						false
+					);
+					ubn_save_order_safely($order);
+
+					return;
+				}
+
+				// Final scheduled failure (all retries exhausted OR permanent 4xx error)
+				delete_post_meta($order_id, '_ubn_next_retry_at');
+				delete_post_meta($order_id, '_ubn_next_retry_attempt');
+				update_post_meta($order_id, '_ubn_retry_exhausted', 'yes');
+
+				$order->delete_meta_data('_ubn_next_retry_at');
+				$order->delete_meta_data('_ubn_next_retry_attempt');
+				$order->update_meta_data('_ubn_retry_exhausted', 'yes');
+				$order->add_order_note(
+					sprintf(
+						'UBN Speed : échec définitif de création d\'expédition (Tentative #%d/%d — %s). Intervention manuelle requise.',
+						$attempt,
+						UBN_MAX_SHIPMENT_ATTEMPTS,
+						$err_msg
+					),
+					false
+				);
+				ubn_save_order_safely($order);
+
+				ubn_send_shipment_failure_email(
+					$order_id,
+					$payload ?: [],
+					$email_error_data,
+					$attempt,
+					$is_retryable
+				);
+			} else {
+				$order->add_order_note(
+					sprintf('UBN Speed : échec lors de la création manuelle de l\'expédition (%s).', $err_msg),
+					false
+				);
+				ubn_save_order_safely($order);
+			}
+		};
+
+		if (empty($payload)) {
+			$err_msg = 'Impossible de préparer les données de colis pour l\'API UBN (payload vide).';
+			$record_shipment_failure(
+				$err_msg,
+				'payload_error',
+				['error' => 'Failed to build shipment payload'],
+				['error' => 'Failed to build shipment payload'],
+				false,
+				''
+			);
+
+			return [
+				'success' => false,
+				'message' => $err_msg,
+			];
 		}
 
+		$endpoint  = trailingslashit($config['api_base']) . 'shipments';
+		$body_raw  = wp_json_encode($payload);
+		$timestamp = time();
+		$message   = $timestamp . "." . $body_raw;
+		$signature = hash_hmac("sha256", $message, $config['api_key']);
+
+		$response = wp_remote_post($endpoint, [
+			'headers' => [
+				'X-UBN-API-KEY'     => $config['api_key'],
+				'X-UBN-Source-Site' => $config['source_site'],
+				'X-UBN-Partner'     => $config['partner_id'],
+				'X-UBN-Customer'    => $config['partner_id'],
+				'X-UBN-Timestamp'   => $timestamp,
+				'X-UBN-Sign'        => $signature,
+				'Content-Type'      => 'application/json',
+			],
+			'body'    => $body_raw,
+			'timeout' => ($context === 'scheduled') ? 45 : 30,
+		]);
+
+		// WP / cURL Network Error
+		if (is_wp_error($response)) {
+			$wp_err_msg = $response->get_error_message();
+			$record_shipment_failure(
+				'Erreur de connexion UBN : ' . $wp_err_msg,
+				'wp_error',
+				['status_code' => 'wp_error', 'wp_error' => $wp_err_msg],
+				['wp_error' => $wp_err_msg],
+				true,
+				$endpoint
+			);
+
+			return [
+				'success' => false,
+				'message' => 'Erreur de connexion UBN : ' . $wp_err_msg,
+			];
+		}
+
+		$status_code   = wp_remote_retrieve_response_code($response);
+		$response_body = wp_remote_retrieve_body($response);
+		$data          = json_decode($response_body, true);
+
+		// API failed
+		if ($status_code >= 400 || empty($data['success'])) {
+			$err_msg = $data['message'] ?? ($data['error'] ?? 'Code HTTP ' . $status_code);
+			if (!empty($data['data']['message'])) {
+				$err_msg = $data['data']['message'];
+			} elseif (!empty($data['data']['expected_postcode'])) {
+				$err_msg .= ' (Code postal attendu : ' . $data['data']['expected_postcode'] . ')';
+			}
+
+			$is_retryable = ubn_is_retryable_shipment_failure(false, $status_code, $data, $response_body);
+
+			$record_shipment_failure(
+				$err_msg,
+				$status_code,
+				[
+					'status_code' => $status_code,
+					'response'    => $data,
+					'raw'         => $response_body,
+				],
+				[
+					'status_code'      => $status_code,
+					'raw_response'     => $response_body,
+					'decoded_response' => $data,
+				],
+				$is_retryable,
+				$endpoint
+			);
+
+			return [
+				'success'     => false,
+				'message'     => $err_msg,
+				'status_code' => $status_code,
+				'data'        => $data,
+			];
+		}
+
+		// Shipment succeeded -> cancel any pending scheduled retries and clear error flags
+		ubn_clear_scheduled_shipment_retries($order_id);
+
+		delete_post_meta($order_id, '_ubn_shipment_error');
+		delete_post_meta($order_id, '_ubn_next_retry_at');
+		delete_post_meta($order_id, '_ubn_next_retry_attempt');
+		delete_post_meta($order_id, '_ubn_retry_exhausted');
+
+		$success_json = wp_json_encode($data, JSON_PRETTY_PRINT);
+
+		// Save shipment meta (both legacy post meta and HPOS order object meta)
+		update_post_meta($order_id, '_ubn_order', 'yes');
+		update_post_meta($order_id, '_ubn_shipment_created', 'yes');
+		update_post_meta($order_id, '_ubn_shipment_attempts', (string) $attempt);
+		update_post_meta($order_id, '_ubn_shipment_success', $success_json);
+		update_post_meta($order_id, '_ubn_tracking_number', $data['tracking_number'] ?? '');
+		update_post_meta($order_id, '_ubn_shipment_id', $data['shipment_id'] ?? '');
+		update_post_meta($order_id, '_ubn_wallet_debit', $data['wallet_debit'] ?? '');
+		update_post_meta($order_id, '_ubn_wallet_ref', $data['wallet_ref'] ?? '');
+		update_post_meta($order_id, '_ubn_pdf_url', $data['pdf_url'] ?? '');
+		update_post_meta($order_id, '_ubn_shipment_response', $data);
+
+		// HPOS compatibility: explicitly update WC_Order meta and persist safely
+		if ($order && is_a($order, 'WC_Order')) {
+			$order->delete_meta_data('_ubn_shipment_error');
+			$order->delete_meta_data('_ubn_next_retry_at');
+			$order->delete_meta_data('_ubn_next_retry_attempt');
+			$order->delete_meta_data('_ubn_retry_exhausted');
+
+			$order->update_meta_data('_ubn_order', 'yes');
+			$order->update_meta_data('_ubn_shipment_created', 'yes');
+			$order->update_meta_data('_ubn_shipment_attempts', (string) $attempt);
+			$order->update_meta_data('_ubn_shipment_success', $success_json);
+			$order->update_meta_data('_ubn_tracking_number', sanitize_text_field($data['tracking_number'] ?? ''));
+			$order->update_meta_data('_ubn_shipment_id', sanitize_text_field($data['shipment_id'] ?? ''));
+			$order->update_meta_data('_ubn_wallet_debit', sanitize_text_field($data['wallet_debit'] ?? ''));
+			$order->update_meta_data('_ubn_wallet_ref', sanitize_text_field($data['wallet_ref'] ?? ''));
+			$order->update_meta_data('_ubn_pdf_url', esc_url_raw($data['pdf_url'] ?? ''));
+			$order->update_meta_data('_ubn_shipment_response', $data);
+
+			$order->add_order_note(
+				sprintf(
+					'Expédition UBN Speed créée avec succès (%s — Suivi : %s, ID : %s).',
+					$context === 'manual' ? 'Action manuelle' : 'Tentative #' . $attempt,
+					$data['tracking_number'] ?? 'N/A',
+					$data['shipment_id'] ?? 'N/A'
+				),
+				false
+			);
+
+			ubn_save_order_safely($order);
+		}
+
+		ubn_send_preparation_email($order, $data);
+
+		// Success log
 		ubn_add_log(
-			'shipment_error',
+			'shipment_success',
 			$endpoint,
 			$payload,
-			[
-				'status_code' => $status_code,
-				'raw_response' => $response_body,
-				'decoded_response' => $data,
-			],
+			$data,
 			$status_code,
 			$order_id,
-			'Shipment API failed'
+			sprintf('Shipment created successfully (%s, attempt #%d)', $context, $attempt)
 		);
-		
-		ubn_send_shipment_failure_email(
-			$order_id,
-			$payload,
-			[
-				'status_code' => $status_code,
-				'raw_response' => $response_body,
-				'decoded_response' => $data,
-			]
-		);
-
-		$err_msg = $data['message'] ?? ($data['error'] ?? 'Code HTTP ' . $status_code);
-		if (!empty($data['data']['message'])) {
-			$err_msg = $data['data']['message'];
-		} elseif (!empty($data['data']['expected_postcode'])) {
-			$err_msg .= ' (Code postal attendu : ' . $data['data']['expected_postcode'] . ')';
-		}
 
 		return [
-			'success'     => false,
-			'message'     => $err_msg,
-			'status_code' => $status_code,
-			'data'        => $data,
+			'success'         => true,
+			'tracking_number' => $data['tracking_number'] ?? '',
+			'shipment_id'     => $data['shipment_id'] ?? '',
+			'data'            => $data,
 		];
+	} finally {
+		delete_transient($lock_key);
 	}
-	
-	delete_post_meta($order_id, '_ubn_shipment_error');
-	if ($order && is_a($order, 'WC_Order')) {
-		$order->delete_meta_data('_ubn_shipment_error');
-	}
-
-	update_post_meta(
-		$order_id,
-		'_ubn_shipment_success',
-		wp_json_encode($data, JSON_PRETTY_PRINT)
-	);
-	
-	
-	// Save shipment meta (both legacy post meta and HPOS order object meta)
-	update_post_meta($order_id, '_ubn_shipment_created', 'yes');
-
-	update_post_meta(
-		$order_id,
-		'_ubn_tracking_number',
-		$data['tracking_number'] ?? ''
-	);
-
-	update_post_meta(
-		$order_id,
-		'_ubn_shipment_id',
-		$data['shipment_id'] ?? ''
-	);
-
-	update_post_meta(
-		$order_id,
-		'_ubn_wallet_debit',
-		$data['wallet_debit'] ?? ''
-	);
-
-	update_post_meta(
-		$order_id,
-		'_ubn_wallet_ref',
-		$data['wallet_ref'] ?? ''
-	);
-
-	update_post_meta(
-		$order_id,
-		'_ubn_pdf_url',
-		$data['pdf_url'] ?? ''
-	);
-
-	update_post_meta(
-		$order_id,
-		'_ubn_shipment_response',
-		$data
-	);
-
-	// HPOS compatibility: explicitly update WC_Order meta and persist
-	if ($order && is_a($order, 'WC_Order')) {
-		$order->update_meta_data('_ubn_shipment_created', 'yes');
-		$order->update_meta_data('_ubn_tracking_number', sanitize_text_field($data['tracking_number'] ?? ''));
-		$order->update_meta_data('_ubn_shipment_id', sanitize_text_field($data['shipment_id'] ?? ''));
-		$order->update_meta_data('_ubn_wallet_debit', sanitize_text_field($data['wallet_debit'] ?? ''));
-		$order->update_meta_data('_ubn_wallet_ref', sanitize_text_field($data['wallet_ref'] ?? ''));
-		$order->update_meta_data('_ubn_pdf_url', esc_url_raw($data['pdf_url'] ?? ''));
-		$order->update_meta_data('_ubn_shipment_response', $data);
-		$order->save();
-	}
-	
-	ubn_send_preparation_email(
-		$order,
-		$data
-	);
-
-	// Success log
-	ubn_add_log(
-		'shipment_success',
-		$endpoint,
-		$payload,
-		$data,
-		$status_code,
-		$order_id,
-		'Shipment created successfully'
-	);
-
-	return [
-		'success'         => true,
-		'tracking_number' => $data['tracking_number'] ?? '',
-		'shipment_id'     => $data['shipment_id'] ?? '',
-		'data'            => $data,
-	];
 }
 /*--------------------------------------------------------------
 
@@ -2969,8 +3242,6 @@ function ubn_add_create_shipment_order_action($actions, $order = null) {
 add_action('woocommerce_order_action_ubn_create_shipment', 'ubn_handle_manual_create_shipment');
 
 function ubn_handle_manual_create_shipment($order) {
-	
-	
 
 	if (!$order) {
 		return;
@@ -2988,8 +3259,7 @@ function ubn_handle_manual_create_shipment($order) {
 		'Manual order action triggered'
 	);
 
-	// Run existing shipment function
-	ubn_create_shipment($order_id);
+	ubn_create_shipment($order_id, ['context' => 'manual']);
 }
 /*--------------------------------------------------------------
 # ORDER METABOX
@@ -3000,55 +3270,45 @@ add_action(
 );
 
 function ubn_register_order_metabox() {
+	$screens = ['shop_order'];
+	if (function_exists('wc_get_page_screen_id')) {
+		$hpos_screen = wc_get_page_screen_id('shop-order');
+		if (!empty($hpos_screen) && !in_array($hpos_screen, $screens, true)) {
+			$screens[] = $hpos_screen;
+		}
+	}
 
-	add_meta_box(
-		'ubn-shipment-box',
-		'UBN Shipment',
-		'ubn_render_order_metabox',
-		'shop_order',
-		'side',
-		'default'
-	);
+	foreach ($screens as $screen) {
+		add_meta_box(
+			'ubn-shipment-box',
+			'UBN Shipment',
+			'ubn_render_order_metabox',
+			$screen,
+			'side',
+			'default'
+		);
+	}
 }
 
-function ubn_render_order_metabox($post) {
+function ubn_render_order_metabox($post_or_order) {
 
-	$order_id = $post->ID;
+	$order    = is_a($post_or_order, 'WC_Order') ? $post_or_order : wc_get_order($post_or_order->ID ?? 0);
+	$order_id = $order ? $order->get_id() : (int) ($post_or_order->ID ?? 0);
 
-	$tracking = get_post_meta(
-		$order_id,
-		'_ubn_tracking_number',
-		true
-	);
+	$tracking      = ubn_get_order_meta_val($order ?: $order_id, '_ubn_tracking_number');
+	$shipment_id   = ubn_get_order_meta_val($order ?: $order_id, '_ubn_shipment_id');
+	$wallet        = ubn_get_order_meta_val($order ?: $order_id, '_ubn_wallet_debit');
+	$pdf           = ubn_get_order_meta_val($order ?: $order_id, '_ubn_pdf_url');
+	$created       = ubn_get_order_meta_val($order ?: $order_id, '_ubn_shipment_created');
+	$next_retry_at = (int) ubn_get_order_meta_val($order ?: $order_id, '_ubn_next_retry_at');
+	$next_attempt  = (int) ubn_get_order_meta_val($order ?: $order_id, '_ubn_next_retry_attempt');
 
-	$shipment_id = get_post_meta(
-		$order_id,
-		'_ubn_shipment_id',
-		true
-	);
-
-	$wallet = get_post_meta(
-		$order_id,
-		'_ubn_wallet_debit',
-		true
-	);
-
-	$pdf = get_post_meta(
-		$order_id,
-		'_ubn_pdf_url',
-		true
-	);
-
-	$created = get_post_meta(
-		$order_id,
-		'_ubn_shipment_created',
-		true
-	);
-
-	if (!$created) {
-
-		echo '<p>No shipment created yet.</p>';
-
+	if ($created !== 'yes') {
+		if ($next_retry_at > time()) {
+			echo '<p style="color:#2271b1;font-weight:600;">Auto-retry #' . esc_html($next_attempt ?: 2) . '/' . esc_html(UBN_MAX_SHIPMENT_ATTEMPTS) . ' scheduled at ' . esc_html(wp_date('H:i', $next_retry_at)) . '.</p>';
+		} else {
+			echo '<p>No shipment created yet.</p>';
+		}
 		return;
 	}
 
@@ -3099,28 +3359,18 @@ function ubn_show_shipment_debug_admin($order) {
 		return;
 	}
 
-	$order_id = $order->get_id();
-
-	$error = get_post_meta(
-		$order_id,
-		'_ubn_shipment_error',
-		true
-	);
-
-	$success = get_post_meta(
-		$order_id,
-		'_ubn_shipment_success',
-		true
-	);
+	$order_id      = $order->get_id();
+	$error         = ubn_get_order_meta_val($order, '_ubn_shipment_error');
+	$success       = ubn_get_order_meta_val($order, '_ubn_shipment_success');
+	$next_retry_at = (int) ubn_get_order_meta_val($order, '_ubn_next_retry_at');
+	$next_attempt  = (int) ubn_get_order_meta_val($order, '_ubn_next_retry_attempt');
 
 	echo '<div style="margin-top:240px;">';
-
-// 	echo '<h3>UBN Shipment </h3>';
 
 	// SUCCESS
 	if ($success) {
 
-		$data = json_decode($success, true);
+		$data = is_array($success) ? $success : json_decode((string) $success, true);
 
 		$tracking_number = $data['tracking_number'] ?? '';
 		$shipment_id     = $data['shipment_id'] ?? '';
@@ -3187,8 +3437,6 @@ function ubn_show_shipment_debug_admin($order) {
 
 			</table>';
 
-		
-
 			echo '
 			<p style="margin-top:18px;">
 
@@ -3201,7 +3449,6 @@ function ubn_show_shipment_debug_admin($order) {
 				</a>
 
 			</p>';
-		
 
 		echo '</div>';
 	}
@@ -3219,6 +3466,11 @@ function ubn_show_shipment_debug_admin($order) {
 			'ubn_clear_error_' . $order_id
 		);
 
+		$retry_banner = '';
+		if ($next_retry_at > time()) {
+			$retry_banner = '<div style="margin-top:8px;padding:8px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;color:#1e40af;font-size:12px;font-weight:600;">Nouvelle tentative automatique #' . esc_html($next_attempt ?: 2) . '/' . esc_html(UBN_MAX_SHIPMENT_ATTEMPTS) . ' programmée à ' . esc_html(wp_date('d/m/Y H:i', $next_retry_at)) . '.</div>';
+		}
+
 		echo '
 		<div style="
 			background:#fff5f5;
@@ -3228,8 +3480,8 @@ function ubn_show_shipment_debug_admin($order) {
 			margin-bottom:15px;
 		">
 			<strong style="color:#dc3232; font-size:14px;">
-				⚠️ Erreur API Expédition UBN Speed
-			</strong>
+				Erreur API Expédition UBN Speed
+			</strong>' . $retry_banner . '
 
 			<pre style="
 				margin-top:10px;
@@ -3239,7 +3491,7 @@ function ubn_show_shipment_debug_admin($order) {
 				border:1px solid #fed7d7;
 				border-radius:4px;
 				font-size:12px;
-			">' . esc_html($error) . '</pre>
+			">' . esc_html(is_string($error) ? $error : wp_json_encode($error, JSON_PRETTY_PRINT)) . '</pre>
 
 			<div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
 				<a
@@ -3247,14 +3499,14 @@ function ubn_show_shipment_debug_admin($order) {
 					class="button button-primary"
 					onclick="return confirm(\'Relancer la création de l\\\'expédition UBN Speed avec les données actuelles de la commande ?\');"
 				>
-					🚀 Réessayer l\'expédition UBN maintenant
+					Réessayer l\'expédition UBN maintenant
 				</a>
 				<a
 					href="' . esc_url($clear_url) . '"
 					class="button button-secondary"
 					onclick="return confirm(\'Effacer cet historique d\\\'erreur ?\');"
 				>
-					🗑️ Effacer cette erreur
+					Effacer cette erreur
 				</a>
 			</div>
 		</div>';
@@ -3265,38 +3517,28 @@ function ubn_show_shipment_debug_admin($order) {
 			'ubn_retry_shipment_' . $order_id
 		);
 
+		$pending_text = ($next_retry_at > time())
+			? 'Création automatique en file d\'attente (prochaine tentative #' . esc_html($next_attempt ?: 1) . ' à ' . esc_html(wp_date('H:i', $next_retry_at)) . ').'
+			: 'Aucune expédition n\'a encore été créée pour cette commande.';
+
 		echo '
 		<div style="margin-bottom:15px; padding:12px 15px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px;">
-			<p style="margin:0 0 10px 0; font-size:13px; color:#334155;"><strong>UBN Speed :</strong> Aucune expédition n\'a encore été créée pour cette commande.</p>
+			<p style="margin:0 0 10px 0; font-size:13px; color:#334155;"><strong>UBN Speed :</strong> ' . $pending_text . '</p>
 			<a
 				href="' . esc_url($create_url) . '"
 				class="button button-primary"
 				onclick="return confirm(\'Créer l\\\'expédition UBN Speed pour cette commande ?\');"
 			>
-				🚀 Créer l\'expédition UBN
+				Créer l\'expédition UBN
 			</a>
 		</div>';
 	}
 
 	echo '</div>';
 	
-	$email_sent = get_post_meta(
-    $order->get_id(),
-    '_ubn_preparation_email_sent',
-    true
-	);
-
-	$email_recipients = get_post_meta(
-		$order->get_id(),
-		'_ubn_preparation_email_recipients',
-		true
-	);
-
-	$email_subject = get_post_meta(
-		$order->get_id(),
-		'_ubn_preparation_email_subject',
-		true
-	);
+	$email_sent       = ubn_get_order_meta_val($order, '_ubn_preparation_email_sent');
+	$email_recipients = ubn_get_order_meta_val($order, '_ubn_preparation_email_recipients');
+	$email_subject    = ubn_get_order_meta_val($order, '_ubn_preparation_email_subject');
 
 	if ($email_sent) :
 	?>
@@ -3376,9 +3618,9 @@ function ubn_handle_order_edit_page_actions() {
 
 		if ($action === 'retry_shipment') {
 			check_admin_referer('ubn_retry_shipment_' . $order_id);
-			$res = ubn_create_shipment($order_id);
+			$res = ubn_create_shipment($order_id, ['context' => 'manual']);
 
-			$redirect_url = wp_get_referer() ?: admin_url('post.php?post=' . $order_id . '&action=edit');
+			$redirect_url = wp_get_referer() ?: ubn_get_order_edit_link($order_id);
 			$redirect_url = remove_query_arg(['ubn_notice', 'ubn_order', 'ubn_tracking', 'ubn_msg', 'ubn_action'], $redirect_url);
 
 			if (!empty($res['success'])) {
@@ -3405,10 +3647,10 @@ function ubn_handle_order_edit_page_actions() {
 			$order = wc_get_order($order_id);
 			if ($order && is_a($order, 'WC_Order')) {
 				$order->delete_meta_data('_ubn_shipment_error');
-				$order->save();
+				ubn_save_order_safely($order);
 			}
 
-			$redirect_url = wp_get_referer() ?: admin_url('post.php?post=' . $order_id . '&action=edit');
+			$redirect_url = wp_get_referer() ?: ubn_get_order_edit_link($order_id);
 			$redirect_url = remove_query_arg(['ubn_notice', 'ubn_order', 'ubn_tracking', 'ubn_msg', 'ubn_action'], $redirect_url);
 			$redirect_url = add_query_arg([
 				'ubn_notice' => 'cleared',
@@ -3422,29 +3664,34 @@ function ubn_handle_order_edit_page_actions() {
 }
 
 /*--------------------------------------------------------------
-# RESET ERROR WHEN ORDER IS EDITED IN WOOCOMMERCE
+# RESET ERROR ONLY WHEN ADMIN MANUALLY SAVES ORDER EDIT FORM
 --------------------------------------------------------------*/
-add_action('woocommerce_update_order', 'ubn_reset_error_on_order_update', 20, 2);
-function ubn_reset_error_on_order_update($order_id, $order = null) {
-	if (!$order_id) {
+add_action('woocommerce_process_shop_order_meta', 'ubn_reset_error_on_order_update', 60, 2);
+function ubn_reset_error_on_order_update($order_id, $post_or_order = null) {
+	if (!$order_id || !is_admin() || wp_doing_ajax() || wp_doing_cron() || !empty($GLOBALS['ubn_internal_order_save'])) {
 		return;
 	}
-	if (!$order || !is_a($order, 'WC_Order')) {
-		$order = wc_get_order($order_id);
+
+	// Do not wipe error if the manual action dropdown "Create UBN Shipment" was submitted at the same time
+	if (!empty($_POST['wc_order_action']) && $_POST['wc_order_action'] === 'ubn_create_shipment') {
+		return;
 	}
+
+	$order = ($post_or_order && is_a($post_or_order, 'WC_Order')) ? $post_or_order : wc_get_order($order_id);
 	if (!$order) {
 		return;
 	}
 
-	// If the order has an existing shipment error and shipment is not created yet,
-	// clear the error so obsolete error messages do not persist after address correction.
-	$created = $order->get_meta('_ubn_shipment_created');
-	if ($created !== 'yes' && get_post_meta($order_id, '_ubn_shipment_created', true) !== 'yes') {
-		if ($order->get_meta('_ubn_shipment_error') || get_post_meta($order_id, '_ubn_shipment_error', true)) {
-			$order->delete_meta_data('_ubn_shipment_error');
-			delete_post_meta($order_id, '_ubn_shipment_error');
-			$order->save();
-		}
+	// Preserve error context while an automatic background retry is still scheduled
+	$next_retry_at = (int) ubn_get_order_meta_val($order, '_ubn_next_retry_at');
+	if ($next_retry_at > time()) {
+		return;
+	}
+
+	if (ubn_get_order_meta_val($order, '_ubn_shipment_created') !== 'yes' && ubn_get_order_meta_val($order, '_ubn_shipment_error')) {
+		$order->delete_meta_data('_ubn_shipment_error');
+		delete_post_meta($order_id, '_ubn_shipment_error');
+		ubn_save_order_safely($order);
 	}
 }
 
@@ -3606,8 +3853,8 @@ function ubn_orders_page() {
 						<?php endif; ?>>
 
 							<td>
-								<a href="<?php echo admin_url('post.php?post=' . $order->get_id() . '&action=edit'); ?>">
-									#<?php echo $order->get_id(); ?>
+								<a href="<?php echo esc_url(ubn_get_order_edit_link($order)); ?>">
+									#<?php echo esc_html($order->get_id()); ?>
 								</a>
 							</td>
 
@@ -3627,21 +3874,18 @@ function ubn_orders_page() {
 
 								<?php
 
-								$shipment_created = get_post_meta(
-									$order->get_id(),
-									'_ubn_shipment_created',
-									true
-								);
+								$shipment_created = ubn_get_order_meta_val($order, '_ubn_shipment_created');
+								$shipment_error   = ubn_get_order_meta_val($order, '_ubn_shipment_error');
+								$next_retry_at    = (int) ubn_get_order_meta_val($order, '_ubn_next_retry_at');
+								$next_attempt     = (int) ubn_get_order_meta_val($order, '_ubn_next_retry_attempt');
 
-								$shipment_error = get_post_meta(
-									$order->get_id(),
-									'_ubn_shipment_error',
-									true
-								);
-
-								if ($shipment_created) {
+								if ($shipment_created === 'yes') {
 
 									echo '<span style="color:#1e7e34;font-weight:600;">Success</span>';
+
+								} elseif ($next_retry_at > time()) {
+
+									echo '<span style="color:#2271b1;font-weight:600;" title="Automatic retry scheduled">Retry #' . esc_html($next_attempt ?: 2) . '/' . esc_html(UBN_MAX_SHIPMENT_ATTEMPTS) . ' (' . esc_html(wp_date('H:i', $next_retry_at)) . ')</span>';
 
 								} elseif ($shipment_error) {
 
@@ -3664,19 +3908,7 @@ function ubn_orders_page() {
 
 								<?php
 
-								$shipment_created = get_post_meta(
-									$order->get_id(),
-									'_ubn_shipment_created',
-									true
-								);
-
-								$shipment_error = get_post_meta(
-									$order->get_id(),
-									'_ubn_shipment_error',
-									true
-								);
-
-								if (!$shipment_created) :
+								if ($shipment_created !== 'yes') :
 
 									$url = wp_nonce_url(
 										admin_url(
@@ -3822,7 +4054,7 @@ function ubn_handle_orders_page_shipment_creation() {
 		'Shipment manually created from Orders page'
 	);
 
-	$res = ubn_create_shipment($order_id);
+	$res = ubn_create_shipment($order_id, ['context' => 'manual']);
 
 	$redirect_url = admin_url('admin.php?page=ubn-ss&tab=orders');
 	if (!empty($res['success'])) {
@@ -4058,7 +4290,7 @@ function ubn_logs_page() {
 
 								<?php if ($log->order_id) : ?>
 
-									<a href="<?php echo admin_url('post.php?post=' . $log->order_id . '&action=edit'); ?>">
+									<a href="<?php echo esc_url(ubn_get_order_edit_link($log->order_id)); ?>">
 
 										#<?php echo esc_html($log->order_id); ?>
 

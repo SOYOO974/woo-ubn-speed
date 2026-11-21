@@ -32,6 +32,15 @@ define('UBN_SOURCE_SITE', 'https://conforama.re');
 
 ## Historique des Versions
 
+* **v1.4.4** :
+  * **Création d'expédition asynchrone & Retries automatiques intelligents** : passage du déclenchement `processing` sur Action Scheduler (`ubn_process_shipment_async` + repli WP-Cron) avec jusqu'à 4 tentatives automatiques sur erreurs réseau / timeouts / HTTP 5xx / `receiver_error` (**immédiat -> +5 min -> +30 min -> +2 h**), verrou anti-doublon (`transient` 60s) et arrêt automatique si la commande est annulée/remboursée.
+  * **Anti-bruit sur les alertes e-mail admin** : l'alerte `[UBN] Shipment Creation Failed` n'est envoyée qu'en cas d'échec définitif des 4 tentatives automatiques ou immédiatement dès le 1er essai s'il s'agit d'une erreur bloquante non retentable (`4xx` validation / code postal / wallet).
+  * **Correction de la conservation d'erreur `_ubn_shipment_error`** : remplacement du hook trop large `woocommerce_update_order` (qui effaçait silencieusement l'erreur lors des `$order->save()` en tâche de fond : IPN Alma, CAPI, sync ERP) par `woocommerce_process_shop_order_meta` restreint aux sauvegardes manuelles dans l'admin.
+  * **Compatibilité HPOS intégrale & Traçabilité** : déclaration officielle `custom_order_tables`, lecture hybride HPOS/Legacy sur l'ensemble des écrans/rapports/BL, notes privées WooCommerce sur chaque tentative et affichage de la prochaine tentative programmée dans *UBN Orders* et sur la fiche commande.
+* **v1.4.3** :
+  * Ajout du fallback `_woocommerce_multi_inventory_inventory` dans `ubn_stock_ok()` pour le mode multi-magasins.
+* **v1.4.2** :
+  * Boutons d'action directe de relance et d'effacement d'erreur sur la fiche commande et bannières de notification admin.
 * **v1.4.1** :
   * Ajout de la compatibilité native HPOS (*High-Performance Order Storage*).
   * Prise en charge des constantes d'environnement `wp-config.php` comme fallback automatique.

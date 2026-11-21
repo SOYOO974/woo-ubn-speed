@@ -39,8 +39,10 @@ function ubn_handle_delivery_note_print() {
         wp_die('Order not found.', 'Not Found', ['response' => 404]);
     }
 
-    // Load Shipment data
-    $shipment_data = get_post_meta($order_id, '_ubn_shipment_response', true);
+    // Load Shipment data (HPOS + Legacy fallback)
+    $shipment_data = function_exists('ubn_get_order_meta_val')
+        ? ubn_get_order_meta_val($order, '_ubn_shipment_response')
+        : get_post_meta($order_id, '_ubn_shipment_response', true);
     if (!is_array($shipment_data)) {
         $shipment_data = [];
     }
