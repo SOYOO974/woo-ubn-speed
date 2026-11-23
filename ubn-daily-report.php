@@ -232,57 +232,162 @@ function ubn_execute_daily_report() {
     $mode = ubn_get_store_mode();
 
     if ($mode === 'single') {
-        $single_orders = [];
+        $single_orders         = [];
+        $single_missing_orders = [];
         foreach ($orders as $order) {
             $shipment_created = function_exists('ubn_get_order_meta_val')
                 ? ubn_get_order_meta_val($order, '_ubn_shipment_created')
                 : get_post_meta($order->get_id(), '_ubn_shipment_created', true);
-            if ($shipment_created !== 'yes') {
-                continue;
+            if ($shipment_created === 'yes') {
+                $single_orders[] = $order;
+            } elseif (ubn_is_actionable_missing_shipment_order($order)) {
+                $single_missing_orders[] = $order;
             }
-            $single_orders[] = $order;
         }
         $brand_name = get_option('ubn_ss_brand_name', get_bloginfo('name'));
-        ubn_process_store_report('single', $brand_name, $single_orders, $date_phrase);
+        ubn_process_store_report('single', $brand_name, $single_orders, $date_phrase, $single_missing_orders);
     } else {
         // 3. Separate by store & filter legacy/HPOS meta
-        $nord_orders = [];
-        $sud_orders = [];
+        $nord_orders         = [];
+        $sud_orders          = [];
+        $nord_missing_orders = [];
+        $sud_missing_orders  = [];
 
         foreach ($orders as $order) {
-            $shipment_created = function_exists('ubn_get_order_meta_val')
-                ? ubn_get_order_meta_val($order, '_ubn_shipment_created')
-                : get_post_meta($order->get_id(), '_ubn_shipment_created', true);
-            if ($shipment_created !== 'yes') {
+            $store_id = ubn_get_order_store_id($order);
+            if ($store_id !== '105' && $store_id !== '106') {
                 continue;
             }
 
-            $store_id = ubn_get_order_store_id($order);
-            if ($store_id === '105') {
-                $nord_orders[] = $order;
-            } elseif ($store_id === '106') {
-                $sud_orders[] = $order;
+            $shipment_created = function_exists('ubn_get_order_meta_val')
+                ? ubn_get_order_meta_val($order, '_ubn_shipment_created')
+                : get_post_meta($order->get_id(), '_ubn_shipment_created', true);
+
+            if ($shipment_created === 'yes') {
+                if ($store_id === '105') {
+                    $nord_orders[] = $order;
+                } else {
+                    $sud_orders[] = $order;
+                }
+            } elseif (ubn_is_actionable_missing_shipment_order($order)) {
+                if ($store_id === '105') {
+                    $nord_missing_orders[] = $order;
+                } else {
+                    $sud_missing_orders[] = $order;
+                }
             }
         }
 
         // 4. Process and send emails
-        ubn_process_store_report('105', 'Conforama Nord', $nord_orders, $date_phrase);
-        ubn_process_store_report('106', 'Conforama Sud', $sud_orders, $date_phrase);
+        ubn_process_store_report('105', 'Conforama Nord', $nord_orders, $date_phrase, $nord_missing_orders);
+        ubn_process_store_report('106', 'Conforama Sud', $sud_orders, $date_phrase, $sud_missing_orders);
     }
 }
 
-function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase) {
+function ubn_is_actionable_missing_shipment_order($order) {
+    if (!$order || !is_a($order, 'WC_Order')) {
+        return false;
+    }
+
+    $non_actionable_statuses = [
+        'pending',
+        'on-hold',
+        'cancelled',
+        'refunded',
+        'failed',
+        'trash',
+        'checkout-draft',
+    ];
+    if (in_array($order->get_status(), $non_actionable_statuses, true)) {
+        return false;
+    }
+
+    if (function_exists('ubn_is_ubn_order') && !ubn_is_ubn_order($order)) {
+        return false;
+    }
+
+    return true;
+}
+
+function ubn_build_missing_shipments_alert_html($missing_orders) {
+    if (empty($missing_orders)) {
+        return '';
+    }
+
+    $count = count($missing_orders);
+    $rows  = '';
+
+    foreach ($missing_orders as $order) {
+        $order_id      = $order->get_id();
+        $error_raw     = function_exists('ubn_get_order_meta_val') ? ubn_get_order_meta_val($order, '_ubn_shipment_error') : '';
+        $next_retry_at = function_exists('ubn_get_order_meta_val') ? (int) ubn_get_order_meta_val($order, '_ubn_next_retry_at') : 0;
+        $edit_url      = function_exists('ubn_get_order_edit_link')
+            ? ubn_get_order_edit_link($order)
+            : admin_url('post.php?post=' . $order_id . '&action=edit');
+
+        if ($next_retry_at > time()) {
+            $state_label = 'Relance auto prévue à ' . wp_date('H:i', $next_retry_at);
+        } elseif (!empty($error_raw)) {
+            $state_label = 'Échec API UBN Speed';
+        } else {
+            $state_label = 'Étiquette UBN non générée';
+        }
+
+        $postcode = $order->get_shipping_postcode() ?: $order->get_billing_postcode();
+        $city     = $order->get_shipping_city() ?: $order->get_billing_city();
+
+        $rows .= '
+        <tr>
+            <td style="padding: 8px 10px; border-bottom: 1px solid #fecaca; font-weight: 700;">#' . esc_html($order->get_order_number()) . '</td>
+            <td style="padding: 8px 10px; border-bottom: 1px solid #fecaca;">' . esc_html($order->get_formatted_billing_full_name()) . ' (' . esc_html(trim($postcode . ' ' . $city)) . ')</td>
+            <td style="padding: 8px 10px; border-bottom: 1px solid #fecaca; color: #991b1b; font-weight: 600;">' . esc_html($state_label) . '</td>
+            <td style="padding: 8px 10px; border-bottom: 1px solid #fecaca; text-align: right;">
+                <a href="' . esc_url($edit_url) . '" target="_blank" rel="noopener" style="display: inline-block; background: #dc2626; color: #ffffff; text-decoration: none; padding: 6px 12px; border-radius: 4px; font-weight: 600; font-size: 12px;">Créer l\'étiquette</a>
+            </td>
+        </tr>';
+    }
+
+    $title = ($count > 1)
+        ? $count . ' commandes payées sans étiquette UBN Speed (action requise)'
+        : '1 commande payée sans étiquette UBN Speed (action requise)';
+
+    return '
+    <div style="border: 2px solid #dc2626; border-radius: 8px; margin-bottom: 24px; background: #fef2f2; overflow: hidden;">
+        <div style="background: #dc2626; color: #ffffff; padding: 12px 18px; font-weight: 700; font-size: 15px;">
+            Attention : ' . esc_html($title) . '
+        </div>
+        <div style="padding: 14px 18px;">
+            <p style="margin: 0 0 12px 0; font-size: 13px; color: #7f1d1d;">
+                L\'étiquette UBN Speed n\'a pas encore pu être générée pour la ou les commandes ci-dessous. Ouvrez la fiche commande pour lancer la création en 1 clic avant l\'enlèvement.
+            </p>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #ffffff; border: 1px solid #fecaca; border-radius: 6px;">
+                <thead>
+                    <tr style="background: #fee2e2; text-align: left; color: #7f1d1d;">
+                        <th style="padding: 8px 10px;">Commande</th>
+                        <th style="padding: 8px 10px;">Client & Ville</th>
+                        <th style="padding: 8px 10px;">Statut UBN</th>
+                        <th style="padding: 8px 10px; text-align: right;">Action</th>
+                    </tr>
+                </thead>
+                <tbody>' . $rows . '</tbody>
+            </table>
+        </div>
+    </div>';
+}
+
+function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase, $missing_orders = []) {
     $emails = ubn_get_store_notification_emails($store_id);
     if (empty($emails)) {
         return; // Nowhere to send
     }
 
-    $orders_count = count($orders);
-    $site_name = get_option('ubn_ss_brand_name', get_bloginfo('name'));
+    $orders_count  = count($orders);
+    $missing_count = count($missing_orders);
+    $site_name     = get_option('ubn_ss_brand_name', get_bloginfo('name'));
     $primary_color = esc_attr(get_option('ubn_ss_primary_color', '#db3832'));
     
-    // Check if empty and if we should send empty report
-    if ($orders_count === 0) {
+    // Check if empty (and no missing-label orders) and if we should send empty report
+    if ($orders_count === 0 && $missing_count === 0) {
         $send_empty = get_option('ubn_ss_report_empty');
         if (!$send_empty) {
             return;
@@ -302,8 +407,8 @@ function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase)
         $message = str_replace(array_keys($tags), array_values($tags), $template);
         $message = wpautop($message);
     } else {
-        // Build the HTML for the orders
-        $orders_html = '';
+        // Build the HTML for missing shipments alert (if any) + created orders
+        $orders_html = ubn_build_missing_shipments_alert_html($missing_orders);
         
         foreach ($orders as $order) {
             $order_id = $order->get_id();
@@ -379,8 +484,26 @@ function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase)
             </div>';
         }
         
+        $default_report_template = '<div style="font-family: Arial,Helvetica,sans-serif; padding: 0;">
+<div style="max-width: 800px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e5e5e5;">
+<div style="background: ' . $primary_color . '; padding: 20px 20px;">
+<h2 style="margin: 0; color: #ffffff;">Rapport journalier UBN Speed - {store_name}</h2>
+</div>
+<div style="padding: 20px;">
+<p style="margin-top: 0;">Bonjour,</p>
+<p>Voici le récapitulatif des commandes UBN Speed créées <strong>{date_phrase}</strong> ({orders_count} commandes).</p>
+{orders_table}
+<br>
+Merci pour votre collaboration.
+</div>
+</div>
+</div>';
+
         $subject = get_option('ubn_ss_daily_report_subject', '[UBN SPEED] {store_name} - Rapport Journalier');
-        $template = get_option('ubn_ss_daily_report_template', '');
+        $template = get_option('ubn_ss_daily_report_template', $default_report_template);
+        if (empty($template)) {
+            $template = $default_report_template;
+        }
         
         $tags = [
             '{site_name}'    => $site_name,
@@ -391,6 +514,9 @@ function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase)
         ];
         
         $subject = str_replace(array_keys($tags), array_values($tags), $subject);
+        if ($missing_count > 0) {
+            $subject .= ' - ACTION REQUISE (' . $missing_count . ' sans étiquette)';
+        }
         $message = str_replace(array_keys($tags), array_values($tags), $template);
         $message = wpautop($message);
     }
@@ -409,7 +535,7 @@ function ubn_process_store_report($store_id, $store_name, $orders, $date_phrase)
             $emails,
             '',
             0,
-            'Daily report sent for ' . $store_name . ' (' . $orders_count . ' orders)'
+            'Daily report sent for ' . $store_name . ' (' . $orders_count . ' orders' . ($missing_count > 0 ? ', ' . $missing_count . ' missing label' : '') . ')'
         );
     } else {
         ubn_add_log(

@@ -32,6 +32,9 @@ define('UBN_SOURCE_SITE', 'https://conforama.re');
 
 ## Historique des Versions
 
+* **v1.4.5** :
+  * **Persistance stricte des erreurs d'expédition (`_ubn_shipment_error`)** : suppression du nettoyage automatique sur `woocommerce_process_shop_order_meta` qui effaçait silencieusement l'alerte d'erreur lors d'une mise à jour de commande (modification d'adresse, changement de statut, synchronisation ERP) avant même que l'expédition ne soit créée, et ajout de l'état d'erreur + bouton d'action rapide dans la métabox latérale *UBN Shipment*.
+  * **Alerte des commandes UBN sans étiquette dans le Rapport Journalier (`ubn-daily-report.php`)** : détection et mise en évidence en tête du rapport matinal de toute commande payée/active (`_ubn_order = yes` hors `pending`/`on-hold`/`cancelled`/`refunded`/`failed`) dont l'étiquette UBN Speed n'a pas pu être générée (`_ubn_shipment_created != yes`), y compris les jours où aucune autre étiquette n'a été créée.
 * **v1.4.4** :
   * **Création d'expédition asynchrone & Retries automatiques intelligents** : passage du déclenchement `processing` sur Action Scheduler (`ubn_process_shipment_async` + repli WP-Cron) avec jusqu'à 4 tentatives automatiques sur erreurs réseau / timeouts / HTTP 5xx / `receiver_error` (**immédiat -> +5 min -> +30 min -> +2 h**), verrou anti-doublon (`transient` 60s) et arrêt automatique si la commande est annulée/remboursée.
   * **Anti-bruit sur les alertes e-mail admin** : l'alerte `[UBN] Shipment Creation Failed` n'est envoyée qu'en cas d'échec définitif des 4 tentatives automatiques ou immédiatement dès le 1er essai s'il s'agit d'une erreur bloquante non retentable (`4xx` validation / code postal / wallet).

@@ -4,7 +4,7 @@
  * Plugin Name: UBN Speed Shipping
  * Plugin URI: https://soyoo.re
  * Description: Custom plugin to Integrate UBN shipping with Conforama.
- * Version: 1.4.4
+ * Version: 1.4.5
  * Author: soyoo.re
  * License: GPL2
  */
@@ -12,7 +12,7 @@
 if (!defined('ABSPATH')) exit;
 
 if (!defined('UBN_SS_VERSION')) {
-	define('UBN_SS_VERSION', '1.4.4');
+	define('UBN_SS_VERSION', '1.4.5');
 }
 if (!defined('UBN_ASYNC_SHIPMENT_HOOK')) {
 	define('UBN_ASYNC_SHIPMENT_HOOK', 'ubn_process_shipment_async');
@@ -3300,12 +3300,27 @@ function ubn_render_order_metabox($post_or_order) {
 	$wallet        = ubn_get_order_meta_val($order ?: $order_id, '_ubn_wallet_debit');
 	$pdf           = ubn_get_order_meta_val($order ?: $order_id, '_ubn_pdf_url');
 	$created       = ubn_get_order_meta_val($order ?: $order_id, '_ubn_shipment_created');
+	$error         = ubn_get_order_meta_val($order ?: $order_id, '_ubn_shipment_error');
 	$next_retry_at = (int) ubn_get_order_meta_val($order ?: $order_id, '_ubn_next_retry_at');
 	$next_attempt  = (int) ubn_get_order_meta_val($order ?: $order_id, '_ubn_next_retry_attempt');
 
 	if ($created !== 'yes') {
 		if ($next_retry_at > time()) {
 			echo '<p style="color:#2271b1;font-weight:600;">Auto-retry #' . esc_html($next_attempt ?: 2) . '/' . esc_html(UBN_MAX_SHIPMENT_ATTEMPTS) . ' scheduled at ' . esc_html(wp_date('H:i', $next_retry_at)) . '.</p>';
+		} elseif ($error) {
+			$retry_url = wp_nonce_url(
+				admin_url('admin.php?ubn_action=retry_shipment&order_id=' . $order_id),
+				'ubn_retry_shipment_' . $order_id
+			);
+			echo '<p style="color:#dc3232;font-weight:600;margin-bottom:8px;">✕ Échec de création de l\'expédition UBN.</p>';
+			echo '<p><a href="' . esc_url($retry_url) . '" class="button button-primary" onclick="return confirm(\'Relancer la création de l\\\'expédition UBN Speed ?\');">Réessayer maintenant</a></p>';
+		} elseif ($order && ubn_is_ubn_order($order)) {
+			$create_url = wp_nonce_url(
+				admin_url('admin.php?ubn_action=retry_shipment&order_id=' . $order_id),
+				'ubn_retry_shipment_' . $order_id
+			);
+			echo '<p style="color:#996800;font-weight:600;margin-bottom:8px;">Aucune expédition UBN créée.</p>';
+			echo '<p><a href="' . esc_url($create_url) . '" class="button button-primary" onclick="return confirm(\'Créer l\\\'expédition UBN Speed pour cette commande ?\');">Créer l\'expédition UBN</a></p>';
 		} else {
 			echo '<p>No shipment created yet.</p>';
 		}
@@ -3664,36 +3679,13 @@ function ubn_handle_order_edit_page_actions() {
 }
 
 /*--------------------------------------------------------------
-# RESET ERROR ONLY WHEN ADMIN MANUALLY SAVES ORDER EDIT FORM
+# PRESERVE _ubn_shipment_error UNTIL SHIPMENT SUCCEEDS OR EXPLICIT CLEAR
 --------------------------------------------------------------*/
-add_action('woocommerce_process_shop_order_meta', 'ubn_reset_error_on_order_update', 60, 2);
-function ubn_reset_error_on_order_update($order_id, $post_or_order = null) {
-	if (!$order_id || !is_admin() || wp_doing_ajax() || wp_doing_cron() || !empty($GLOBALS['ubn_internal_order_save'])) {
-		return;
-	}
-
-	// Do not wipe error if the manual action dropdown "Create UBN Shipment" was submitted at the same time
-	if (!empty($_POST['wc_order_action']) && $_POST['wc_order_action'] === 'ubn_create_shipment') {
-		return;
-	}
-
-	$order = ($post_or_order && is_a($post_or_order, 'WC_Order')) ? $post_or_order : wc_get_order($order_id);
-	if (!$order) {
-		return;
-	}
-
-	// Preserve error context while an automatic background retry is still scheduled
-	$next_retry_at = (int) ubn_get_order_meta_val($order, '_ubn_next_retry_at');
-	if ($next_retry_at > time()) {
-		return;
-	}
-
-	if (ubn_get_order_meta_val($order, '_ubn_shipment_created') !== 'yes' && ubn_get_order_meta_val($order, '_ubn_shipment_error')) {
-		$order->delete_meta_data('_ubn_shipment_error');
-		delete_post_meta($order_id, '_ubn_shipment_error');
-		ubn_save_order_safely($order);
-	}
-}
+// Intentional no-op on woocommerce_process_shop_order_meta:
+// Saving an order in wp-admin (address fix, status change, ERP sync) must NEVER
+// silently wipe _ubn_shipment_error before an actual UBN shipment is created.
+// _ubn_shipment_error is cleared exclusively when ubn_create_shipment() succeeds
+// or when an admin explicitly clicks "Effacer cette erreur" (ubn_action=clear_error).
 
 /*--------------------------------------------------------------
 # ADMIN NOTICES FOR UBN ACTIONS
